@@ -1,82 +1,68 @@
 package libp2ptls
 
 import (
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"errors"
 	"fmt"
+	"golang.org/x/sys/cpu"
 	"math/big"
 	"time"
 
-	"golang.org/x/sys/cpu"
-
 	ic "github.com/libp2p/go-libp2p-core/crypto"
+	pb "github.com/libp2p/go-libp2p-core/crypto/pb"
 	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/minio/sha256-simd"
 )
 
 const certValidityPeriod = 100 * 365 * 24 * time.Hour // ~100 years
 const certificatePrefix = "libp2p-tls-handshake:"
-const alpn string = "libp2p"
 
 var extensionID = getPrefixedExtensionID([]int{1, 1})
 var extensionCritical bool // so we can mark the extension critical in tests
+
+// Identity is used to generate secure config for connection
+type Identity struct {
+	config tls.Config
+}
 
 type signedKey struct {
 	PubKey    []byte
 	Signature []byte
 }
 
-// Identity is used to secure connections
-type Identity struct {
-	config tls.Config
-}
-
-// NewIdentity creates a new identity
-func NewIdentity(privKey ic.PrivKey) (*Identity, error) {
-	cert, err := keyToCertificate(privKey)
-	if err != nil {
-		return nil, err
-	}
+func NewIdentity(cert tls.Certificate, certPoll *x509.CertPool) (*Identity, error) {
 	return &Identity{
 		config: tls.Config{
-			MinVersion:               tls.VersionTLS13,
-			PreferServerCipherSuites: preferServerCipherSuites(),
-			InsecureSkipVerify:       true, // This is not insecure here. We will verify the cert chain ourselves.
-			ClientAuth:               tls.RequireAnyClientCert,
-			Certificates:             []tls.Certificate{*cert},
-			VerifyPeerCertificate: func(_ [][]byte, _ [][]*x509.Certificate) error {
-				panic("tls config not specialized for peer")
-			},
-			NextProtos:             []string{alpn},
-			SessionTicketsDisabled: true,
+			Certificates: []tls.Certificate{cert},
+			// for server
+			ClientAuth: tls.RequireAndVerifyClientCert,
+			ClientCAs:  certPoll,
+			// for client
+			// client need to skip hostname verify
+			RootCAs:            certPoll,
+			InsecureSkipVerify: true, // Not actually skipping, we check the cert in VerifyPeerCertificate
 		},
 	}, nil
 }
 
-// ConfigForAny is a short-hand for ConfigForPeer("").
 func (i *Identity) ConfigForAny() (*tls.Config, <-chan ic.PubKey) {
-	return i.ConfigForPeer("")
+	return i.ConfigForPeer("", "")
 }
 
-// ConfigForPeer creates a new single-use tls.Config that verifies the peer's
-// certificate chain and returns the peer's public key via the channel. If the
-// peer ID is empty, the returned config will accept any peer.
-//
-// It should be used to create a new tls.Config before securing either an
-// incoming or outgoing connection.
-func (i *Identity) ConfigForPeer(remote peer.ID) (*tls.Config, <-chan ic.PubKey) {
+func (i *Identity) ConfigForPeer(remote peer.ID, addr string) (*tls.Config, <-chan ic.PubKey) {
 	keyCh := make(chan ic.PubKey, 1)
-	// We need to check the peer ID in the VerifyPeerCertificate callback.
-	// The tls.Config it is also used for listening, and we might also have concurrent dials.
-	// Clone it so we can check for the specific peer ID we're dialing here.
 	conf := i.config.Clone()
-	// We're using InsecureSkipVerify, so the verifiedChains parameter will always be empty.
-	// We need to parse the certificates ourselves from the raw certs.
+
+	// fetch the public key from the certs
 	conf.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 		defer close(keyCh)
 
@@ -89,9 +75,28 @@ func (i *Identity) ConfigForPeer(remote peer.ID) (*tls.Config, <-chan ic.PubKey)
 			chain[i] = cert
 		}
 
-		pubKey, err := PubKeyFromCertChain(chain)
+		// Code copy/pasted https://github.com/digitalbitbox/bitbox-wallet-app/blob/b04bd07852d5b37939da75b3555b5a1e34a976ee/backend/coins/btc/electrum/electrum.go#L76-L111
+		opts := x509.VerifyOptions{
+			Roots:         conf.ClientCAs,
+			CurrentTime:   time.Now(),
+			DNSName:       "", // <- skip hostname verification
+			Intermediates: x509.NewCertPool(),
+		}
+
+		for i, cert := range chain {
+			if i == 0 {
+				continue
+			}
+			opts.Intermediates.AddCert(cert)
+		}
+		_, err := chain[0].Verify(opts)
 		if err != nil {
 			return err
+		}
+
+		tmp := chain[0].PublicKey.(*ecdsa.PublicKey)
+		pubKey := &ECDSAPublicKey{
+			pub: tmp,
 		}
 		if remote != "" && !remote.MatchesPublicKey(pubKey) {
 			peerID, err := peer.IDFromPublicKey(pubKey)
@@ -105,6 +110,92 @@ func (i *Identity) ConfigForPeer(remote peer.ID) (*tls.Config, <-chan ic.PubKey)
 	}
 	return conf, keyCh
 }
+
+// RsaPublicKey is an rsa public key
+type RsaPublicKey struct {
+	k rsa.PublicKey
+}
+
+// Verify compares a signature against input data
+func (pk *RsaPublicKey) Verify(data, sig []byte) (bool, error) {
+	hashed := sha256.Sum256(data)
+	err := rsa.VerifyPKCS1v15(&pk.k, crypto.SHA256, hashed[:], sig)
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (pk *RsaPublicKey) Type() pb.KeyType {
+	return pb.KeyType_RSA
+}
+
+// Bytes returns protobuf bytes of a public key
+func (pk *RsaPublicKey) Bytes() ([]byte, error) {
+	return ic.MarshalPublicKey(pk)
+}
+
+func (pk *RsaPublicKey) Raw() ([]byte, error) {
+	return x509.MarshalPKIXPublicKey(&pk.k)
+}
+
+// Equals checks whether this key is equal to another
+func (pk *RsaPublicKey) Equals(k ic.Key) bool {
+	// make sure this is an rsa public key
+	other, ok := (k).(*RsaPublicKey)
+	if !ok {
+		return basicEquals(pk, k)
+	}
+
+	return pk.k.N.Cmp(other.k.N) == 0 && pk.k.E == other.k.E
+}
+
+func basicEquals(k1, k2 ic.Key) bool {
+	if k1.Type() != k2.Type() {
+		return false
+	}
+
+	a, err := k1.Raw()
+	if err != nil {
+		return false
+	}
+	b, err := k2.Raw()
+	if err != nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare(a, b) == 1
+}
+
+// ECDSAPublicKey is an implementation of an ECDSA public key
+type ECDSAPublicKey struct {
+	pub *ecdsa.PublicKey
+}
+
+// Bytes returns the public key as protobuf bytes
+func (ePub *ECDSAPublicKey) Bytes() ([]byte, error) {
+	return ic.MarshalPublicKey(ePub)
+}
+
+// Type returns the key type
+func (ePub *ECDSAPublicKey) Type() pb.KeyType {
+	return pb.KeyType_ECDSA
+}
+
+// Raw returns x509 bytes from a public key
+func (ePub *ECDSAPublicKey) Raw() ([]byte, error) {
+	return x509.MarshalPKIXPublicKey(ePub.pub)
+}
+
+// Equals compares to public keys
+func (ePub *ECDSAPublicKey) Equals(o ic.Key) bool {
+	return basicEquals(ePub, o)
+}
+
+// Verify compares data to a signature
+func (ePub *ECDSAPublicKey) Verify(data, sigBytes []byte) (bool, error) {
+	return true, nil
+}
+
 
 // PubKeyFromCertChain verifies the certificate chain and extract the remote's public key.
 func PubKeyFromCertChain(chain []*x509.Certificate) (ic.PubKey, error) {

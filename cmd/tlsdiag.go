@@ -4,7 +4,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/libp2p/go-libp2p-tls/cmd/tlsdiag"
+	"github.com/libp2p/go-libp2p-tls/cmd/tlsdiag/client"
+	"github.com/libp2p/go-libp2p-tls/cmd/tlsdiag/server"
 )
 
 func main() {
@@ -20,9 +21,9 @@ func main() {
 	var err error
 	switch role {
 	case "client":
-		err = tlsdiag.StartClient()
+		err = client.StartClient()
 	case "server":
-		err = tlsdiag.StartServer()
+		err = server.StartServer()
 	default:
 		fmt.Println("invalid argument. Expected client / server")
 		return

@@ -1,26 +1,43 @@
-package tlsdiag
+package client
 
 import (
 	"context"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net"
 	"time"
 
+	"github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/peer"
-	libp2ptls "github.com/libp2p/go-libp2p-tls"
+
+	libp2ptlsca "github.com/libp2p/go-libp2p-tls"
+)
+
+const (
+	keyFile  = "./cmd/tlsdiag/client/client.key"
+	certFile = "./cmd/tlsdiag/client/client.crt"
+	caFile   = "./cmd/tlsdiag/rootCA.crt"
 )
 
 func StartClient() error {
 	port := flag.Int("p", 5533, "port")
-	peerIDString := flag.String("id", "", "peer ID")
-	keyType := flag.String("key", "ecdsa", "rsa, ecdsa, ed25519 or secp256k1")
+	peerIDString := flag.String("id", "QmZaB9gz9Vhuc3Gc1mz1tAXUCqkfsKZXieQiEiUk57xQiF", "peer ID")
 	flag.Parse()
 
-	priv, err := generateKey(*keyType)
+	certBytes, err := ioutil.ReadFile(keyFile)
 	if err != nil {
+		log.Println("unable to read client.pem, error: ", err)
 		return err
+	}
+	block, _ := pem.Decode(certBytes)
+
+	priv, err := crypto.UnmarshalECDSAPrivateKey(block.Bytes)
+	//priv, err := crypto.UnmarshalRsaPrivateKey(block.Bytes)
+	if err != nil {
+		panic(err)
 	}
 
 	peerID, err := peer.Decode(*peerIDString)
@@ -33,7 +50,8 @@ func StartClient() error {
 		return err
 	}
 	fmt.Printf(" Peer ID: %s\n", id.Pretty())
-	tp, err := libp2ptls.New(priv)
+	libp2ptlsca.Init(caFile, certFile, keyFile)
+	tp, err := libp2ptlsca.New(priv)
 	if err != nil {
 		return err
 	}
@@ -42,6 +60,7 @@ func StartClient() error {
 	fmt.Printf("Dialing %s\n", remoteAddr)
 	conn, err := net.Dial("tcp", remoteAddr)
 	if err != nil {
+		fmt.Printf("net.Dial error")
 		return err
 	}
 	fmt.Printf("Dialed raw connection to %s\n", conn.RemoteAddr())
@@ -49,12 +68,16 @@ func StartClient() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	sconn, err := tp.SecureOutbound(ctx, conn, peerID)
+
+	fmt.Println("tlsdia ca client")
 	if err != nil {
 		return err
 	}
+	fmt.Println("tlsdia ca client")
 	fmt.Printf("Authenticated server: %s\n", sconn.RemotePeer().Pretty())
 	data, err := ioutil.ReadAll(sconn)
 	if err != nil {
+		fmt.Println("read all error")
 		return err
 	}
 	fmt.Printf("Received message from server: %s\n", string(data))
