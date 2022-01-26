@@ -3,7 +3,10 @@ package libp2ptls
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"io/ioutil"
+	"log"
 	"net"
 	"sync"
 
@@ -13,7 +16,23 @@ import (
 )
 
 // ID is the protocol ID (used when negotiating with multistream)
-const ID = "/tls/1.0.0"
+const ID = "/tls-ca/1.0.0"
+
+type Config struct {
+	caFile   string
+	certFile string
+	keyFile  string
+}
+
+var config Config
+
+func Init(caFile, certFile, keyFile string) {
+	config = Config{
+		caFile:   caFile,
+		certFile: certFile,
+		keyFile:  keyFile,
+	}
+}
 
 // Transport constructs secure communication sessions for a peer.
 type Transport struct {
@@ -34,7 +53,25 @@ func New(key ci.PrivKey) (*Transport, error) {
 		privKey:   key,
 	}
 
-	identity, err := NewIdentity(key)
+	var cert tls.Certificate
+	cert, err = tls.LoadX509KeyPair(config.certFile, config.keyFile)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+
+	var clientCertPool *x509.CertPool
+	caCertBytes, err := ioutil.ReadFile(config.caFile)
+	if err != nil {
+		panic("unable to read client.pem")
+	}
+	clientCertPool = x509.NewCertPool()
+	ok := clientCertPool.AppendCertsFromPEM(caCertBytes)
+	if !ok {
+		panic("failed to parse root certificate")
+	}
+
+	identity, err := NewIdentity(cert, clientCertPool)
 	if err != nil {
 		return nil, err
 	}
@@ -42,7 +79,6 @@ func New(key ci.PrivKey) (*Transport, error) {
 	return t, nil
 }
 
-var _ sec.SecureTransport = &Transport{}
 
 // SecureInbound runs the TLS handshake as a server.
 // If p is empty, connections from any peer are accepted.
@@ -51,22 +87,18 @@ func (t *Transport) SecureInbound(ctx context.Context, insecure net.Conn, p peer
 	cs, err := t.handshake(ctx, tls.Server(insecure, config), keyCh)
 	if err != nil {
 		insecure.Close()
+		log.Printf("transport handshake error %s", err.Error())
 	}
 	return cs, err
 }
 
-// SecureOutbound runs the TLS handshake as a client.
-// Note that SecureOutbound will not return an error if the server doesn't
-// accept the certificate. This is due to the fact that in TLS 1.3, the client
-// sends its certificate and the ClientFinished in the same flight, and can send
-// application data immediately afterwards.
-// If the handshake fails, the server will close the connection. The client will
-// notice this after 1 RTT when calling Read.
+// SecureOutbound runs the TLS handshake as a client
 func (t *Transport) SecureOutbound(ctx context.Context, insecure net.Conn, p peer.ID) (sec.SecureConn, error) {
 	config, keyCh := t.identity.ConfigForPeer(p)
 	cs, err := t.handshake(ctx, tls.Client(insecure, config), keyCh)
 	if err != nil {
 		insecure.Close()
+		log.Printf("transport handshake error %s", err.Error())
 	}
 	return cs, err
 }
@@ -130,6 +162,7 @@ func (t *Transport) handshake(
 		}
 		return nil, err
 	}
+	log.Printf("set up connection with remote %v", conn.RemoteAddr())
 	return conn, nil
 }
 

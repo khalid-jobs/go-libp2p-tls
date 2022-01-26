@@ -1,9 +1,13 @@
-package tlsdiag
+package server
 
 import (
 	"context"
+	"encoding/pem"
 	"flag"
 	"fmt"
+	"github.com/libp2p/go-libp2p-core/crypto"
+	"io/ioutil"
+	"log"
 	"net"
 	"time"
 
@@ -11,14 +15,28 @@ import (
 	libp2ptls "github.com/libp2p/go-libp2p-tls"
 )
 
+const (
+	keyFile  = "./cmd/tlsdiag/server/server.key"
+	certFile = "./cmd/tlsdiag/server/server.crt"
+	caFile   = "./cmd/tlsdiag/rootCA.crt"
+)
+
 func StartServer() error {
 	port := flag.Int("p", 5533, "port")
-	keyType := flag.String("key", "ecdsa", "rsa, ecdsa, ed25519 or secp256k1")
+	//keyType := flag.String("key", "ecdsa", "rsa, ecdsa, ed25519 or secp256k1")
 	flag.Parse()
 
-	priv, err := generateKey(*keyType)
+	certBytes, err := ioutil.ReadFile(keyFile)
 	if err != nil {
+		log.Println("unable to read client.pem, error: ", err)
 		return err
+	}
+	block, _ := pem.Decode(certBytes)
+
+	priv, err := crypto.UnmarshalECDSAPrivateKey(block.Bytes)
+	//priv, err := crypto.UnmarshalRsaPrivateKey(block.Bytes)
+	if err != nil {
+		panic("load priv key from file failed: " + err.Error())
 	}
 
 	id, err := peer.IDFromPrivateKey(priv)
@@ -26,12 +44,13 @@ func StartServer() error {
 		return err
 	}
 	fmt.Printf(" Peer ID: %s\n", id.Pretty())
+	libp2ptls.Init(caFile, certFile, keyFile)
 	tp, err := libp2ptls.New(priv)
 	if err != nil {
 		return err
 	}
 
-	ln, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", *port))
+	ln, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", *port))
 	if err != nil {
 		return err
 	}

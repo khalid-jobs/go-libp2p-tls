@@ -1,10 +1,13 @@
-package tlsdiag
+package client
 
 import (
 	"context"
+	"encoding/pem"
 	"flag"
 	"fmt"
+	"github.com/libp2p/go-libp2p-core/crypto"
 	"io/ioutil"
+	"log"
 	"net"
 	"time"
 
@@ -12,16 +15,30 @@ import (
 	libp2ptls "github.com/libp2p/go-libp2p-tls"
 )
 
+const (
+	keyFile  = "./cmd/tlsdiag/client/client.key"
+	certFile = "./cmd/tlsdiag/client/client.crt"
+	caFile   = "./cmd/tlsdiag/rootCA.crt"
+)
+
 func StartClient() error {
 	port := flag.Int("p", 5533, "port")
-	peerIDString := flag.String("id", "", "peer ID")
-	keyType := flag.String("key", "ecdsa", "rsa, ecdsa, ed25519 or secp256k1")
+	peerIDString := flag.String("id", "QmZaB9gz9Vhuc3Gc1mz1tAXUCqkfsKZXieQiEiUk57xQiF", "peer ID")
 	flag.Parse()
 
-	priv, err := generateKey(*keyType)
+	certBytes, err := ioutil.ReadFile(keyFile)
 	if err != nil {
+		log.Println("unable to read client.pem, error: ", err)
 		return err
 	}
+	block, _ := pem.Decode(certBytes)
+
+	priv, err := crypto.UnmarshalECDSAPrivateKey(block.Bytes)
+	//priv, err := crypto.UnmarshalRsaPrivateKey(block.Bytes)
+	if err != nil {
+		panic(err)
+	}
+
 
 	peerID, err := peer.Decode(*peerIDString)
 	if err != nil {
@@ -33,6 +50,7 @@ func StartClient() error {
 		return err
 	}
 	fmt.Printf(" Peer ID: %s\n", id.Pretty())
+	libp2ptls.Init(caFile, certFile, keyFile)
 	tp, err := libp2ptls.New(priv)
 	if err != nil {
 		return err
@@ -42,6 +60,7 @@ func StartClient() error {
 	fmt.Printf("Dialing %s\n", remoteAddr)
 	conn, err := net.Dial("tcp", remoteAddr)
 	if err != nil {
+		fmt.Printf("net.Dial error")
 		return err
 	}
 	fmt.Printf("Dialed raw connection to %s\n", conn.RemoteAddr())
@@ -52,9 +71,11 @@ func StartClient() error {
 	if err != nil {
 		return err
 	}
+	fmt.Println("tlsdia ca client")
 	fmt.Printf("Authenticated server: %s\n", sconn.RemotePeer().Pretty())
 	data, err := ioutil.ReadAll(sconn)
 	if err != nil {
+		fmt.Println("read all error")
 		return err
 	}
 	fmt.Printf("Received message from server: %s\n", string(data))
